@@ -2,7 +2,6 @@ package dev.shizuku.relay
 
 import rikka.shizuku.Shizuku
 import java.lang.reflect.Method
-import java.util.concurrent.TimeUnit
 
 // Runs a shell command as the shell user through Shizuku.
 object Shell {
@@ -25,25 +24,33 @@ object Shell {
         return try {
             val p = newProcess.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
             val buf = arrayOf("", "")
-            val threads = listOf(
+            val readers = listOf(
                 Thread { buf[0] = drain(p.inputStream) },
                 Thread { buf[1] = drain(p.errorStream) },
             )
-            threads.forEach { it.start() }
+            readers.forEach { it.start() }
 
-            if (!p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+            // ShizukuRemoteProcess has no waitFor(timeout): block in a thread instead.
+            val code = intArrayOf(-1)
+            val waiter = Thread {
+                try {
+                    code[0] = p.waitFor()
+                } catch (_: Throwable) {
+                }
+            }
+            waiter.start()
+            waiter.join(timeoutMs)
+            if (waiter.isAlive) {
                 p.destroy()
-                Thread.sleep(200)
+                waiter.join(2000)
             }
-            threads.forEach { it.join(3000) }
+            readers.forEach { it.join(3000) }
+            if (waiter.isAlive) {
+                return Result(-1, "Timeout after ${timeoutMs / 1000}s", false)
+            }
 
-            val code = try {
-                p.exitValue()
-            } catch (_: IllegalThreadStateException) {
-                -1
-            }
             val out = (buf[0] + buf[1]).take(CAP)
-            Result(code, out, code == 0)
+            Result(code[0], out, code[0] == 0)
         } catch (t: Throwable) {
             Result(-1, t.message ?: t.javaClass.simpleName, false)
         }

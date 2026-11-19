@@ -11,13 +11,26 @@ android {
         applicationId = "dev.shizuku.relay"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.1.1"
+    }
+
+    val ks = System.getenv("KEYSTORE_FILE")
+    signingConfigs {
+        if (ks != null) {
+            create("relay") {
+                storeFile = file(ks)
+                storePassword = System.getenv("KEYSTORE_PASS")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASS")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (ks != null) signingConfig = signingConfigs.getByName("relay")
         }
     }
 

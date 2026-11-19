@@ -45,7 +45,7 @@ drops when the service sleeps. The app reconnects by itself.
 The app needs an Android SDK. This device has none. Two ways:
 
 - **GitHub**: push, then open **Actions > android**. The workflow builds
-  `app-debug.apk`. Download it from the run page.
+  `app-release.apk`. Download it from the run page or from Releases.
 - **Local**: `gradle -p android assembleDebug` with a JDK 17 and Android SDK 35.
 
 Install the APK. Install and start the Shizuku app first. Shizuku must be
@@ -116,9 +116,8 @@ curl -s https://<service>.onrender.com/mcp \
 
 - **First run is the real test.** The relay passes its tests, but Shizuku paths
   are untested on hardware from here. Run `doctor` first.
-- The debug APK is signed with a debug key. A new CI run makes a new key, so
-  Android refuses the update. Uninstall the old app to install the new one.
-  To fix: add a release signing key to the build.
+- The release APK is signed with the key in the repo secrets. Updates install
+  over the old version. Keep the keystore safe: a new key means a new app.
 - No update checker and no in-app update flow yet.
 - The free Render plan has no disk. Nothing is stored. Saved commands and logs
   are not built yet.
