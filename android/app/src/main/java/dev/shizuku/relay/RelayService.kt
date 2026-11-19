@@ -2,9 +2,7 @@ package dev.shizuku.relay
 
 import android.app.KeyguardManager
 import android.app.Notification
-import android.app.KeyguardManager
 import android.app.NotificationChannel
-import android.app.KeyguardManager
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service

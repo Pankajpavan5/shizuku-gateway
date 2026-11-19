@@ -49,7 +49,6 @@ enum Out {
 struct Link {
     id: u64,
     tx: mpsc::UnboundedSender<Out>,
-    device: Arc<Mutex<String>>,
 }
 
 struct Reply {
@@ -196,12 +195,7 @@ async fn relay_ws(State(st): State<App>, ws: WebSocketUpgrade) -> Response {
 async fn relay_loop(st: App, mut socket: WebSocket) {
     let id = st.seq.fetch_add(1, Ordering::SeqCst);
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
-    let device = Arc::new(Mutex::new(String::new()));
-    let old = st.link.lock().await.replace(Link {
-        id,
-        tx,
-        device: device.clone(),
-    });
+    let old = st.link.lock().await.replace(Link { id, tx });
     if let Some(old) = old {
         let _ = old.tx.send(Out::Close);
     }
@@ -223,9 +217,7 @@ async fn relay_loop(st: App, mut socket: WebSocket) {
                         match msg {
                             Message::Text(t) => {
                                 if let Ok(v) = serde_json::from_str::<Value>(t.as_str()) {
-                                    if let Some(h) = v.get("hello") {
-                                        *device.lock().await = h.to_string().chars().take(200).collect();
-                                    } else if let (Some(rid), Some(ok)) = (
+                                    if let (Some(rid), Some(ok)) = (
                                         v["id"].as_u64(),
                                         v.get("ok").and_then(Value::as_bool),
                                     ) {
