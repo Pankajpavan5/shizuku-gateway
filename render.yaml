@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: shizuku-relay
+    runtime: docker
+    plan: free
+    dockerContext: ./relay
+    dockerfilePath: ./relay/Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: MCP_HTTP_TOKEN
+        sync: false
+      - key: RELAY_TOKEN
+        sync: false
