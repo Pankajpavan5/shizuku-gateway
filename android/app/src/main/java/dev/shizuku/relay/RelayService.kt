@@ -1,7 +1,10 @@
 package dev.shizuku.relay
 
+import android.app.KeyguardManager
 import android.app.Notification
+import android.app.KeyguardManager
 import android.app.NotificationChannel
+import android.app.KeyguardManager
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -40,6 +43,7 @@ class RelayService : Service() {
         private const val NOTIF_ID = 1
         private const val ASK_ID = 2
         private const val IDLE_MS = 30 * 60 * 1000L
+        private const val APPROVE_PERMISSION = "dev.shizuku.relay.APPROVE"
 
         @Volatile
         var status: String = "stopped"
@@ -190,6 +194,14 @@ class RelayService : Service() {
                 return
             }
             if (Prefs.ask(this)) {
+                if (cmd.length > 800) {
+                    reply(ws, id, false, "Command too long for approval (max 800 chars).", -1)
+                    return
+                }
+                if (getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true) {
+                    reply(ws, id, false, "Phone is locked. Unlock it and retry.", -1)
+                    return
+                }
                 if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
                     reply(ws, id, false, "Notifications are off. Allow them for this app.", -1)
                     return
@@ -228,6 +240,7 @@ class RelayService : Service() {
             .setContentText(cmd.take(200))
             .setStyle(NotificationCompat.BigTextStyle().bigText(cmd.take(800)))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setAutoCancel(true)
             .setTimeoutAfter(30_000)
             .addAction(0, "Deny", approvalIntent(ACTION_DENY, id, 3))
@@ -258,25 +271,15 @@ class RelayService : Service() {
         )
 
     private fun registerForApprovals() {
+        val filter = IntentFilter().apply {
+            addAction(ACTION_APPROVE)
+            addAction(ACTION_DENY)
+        }
         if (Build.VERSION.SDK_INT >= 33) {
-            ContextCompat.registerReceiver(
-                this,
-                approvals,
-                IntentFilter().apply {
-                    addAction(ACTION_APPROVE)
-                    addAction(ACTION_DENY)
-                },
-                ContextCompat.RECEIVER_NOT_EXPORTED,
-            )
+            ContextCompat.registerReceiver(this, approvals, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         } else {
-            @Suppress("UnspecifiedRegisterReceiverFlag")
-            registerReceiver(
-                approvals,
-                IntentFilter().apply {
-                    addAction(ACTION_APPROVE)
-                    addAction(ACTION_DENY)
-                },
-            )
+            // API 26-32: a runtime receiver is exported by default.
+            registerReceiver(approvals, filter, APPROVE_PERMISSION, null)
         }
         receiverOn = true
     }

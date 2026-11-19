@@ -30,7 +30,7 @@ MCP_HTTP_TOKEN=<random 48 hex chars>
 RELAY_TOKEN=<random 48 hex chars>
 ```
 
-Make them with `openssl rand -hex 24`. Use different values. Both must be 16+
+Make them with `openssl rand -hex 24`. Use different values. Both must be 32+
 chars or the server exits.
 
 4. Deploy. The image is built from `relay/Dockerfile`. The health path is
@@ -92,7 +92,7 @@ the phone.
 
 ```
 curl -s https://<service>.onrender.com/healthz
-# {"device":"connected","info":"{\"model\":\"SM-A346E\",...}","ok":true}
+# {"ok":true}
 
 curl -s https://<service>.onrender.com/mcp \
   -H "Authorization: Bearer $MCP_HTTP_TOKEN" \
@@ -123,4 +123,7 @@ curl -s https://<service>.onrender.com/mcp \
 - The free Render plan has no disk. Nothing is stored. Saved commands and logs
   are not built yet.
 - `adb_shell` is a full shell. Guard `MCP_HTTP_TOKEN` like a password. Keep
-  approval on.
+  approval on. With approval on, a command must be 800 characters or less, and
+  the phone must be unlocked.
+- `notifications` reads unredacted notification text. This includes one-time
+  codes from other apps.

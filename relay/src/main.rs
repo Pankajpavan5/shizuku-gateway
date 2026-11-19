@@ -41,9 +41,14 @@ struct App {
     seq: Arc<AtomicU64>,
 }
 
+enum Out {
+    Text(String),
+    Close,
+}
+
 struct Link {
     id: u64,
-    tx: mpsc::UnboundedSender<String>,
+    tx: mpsc::UnboundedSender<Out>,
     device: Arc<Mutex<String>>,
 }
 
@@ -70,12 +75,29 @@ fn router(st: App) -> Router {
         st.clone(),
         relay_gate,
     ));
+    // Auth runs before the handler, so the body is never read for a bad token.
+    let mcp = post(mcp_post)
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024))
+        .layer(axum::middleware::from_fn_with_state(st.clone(), mcp_gate));
     Router::new()
         .route("/", get(root))
         .route("/healthz", get(health))
-        .route("/mcp", post(mcp_post))
+        .route("/mcp", mcp)
         .route("/relay", relay)
         .with_state(st)
+}
+
+async fn mcp_gate(
+    State(st): State<App>,
+    headers: HeaderMap,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if bearer(&headers).is_some_and(|t| ct_eq(t, &st.mcp_token)) {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    }
 }
 
 async fn relay_gate(
@@ -105,23 +127,13 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-async fn root(State(st): State<App>) -> impl IntoResponse {
-    let online = st.link.lock().await.is_some();
-    format!(
-        "shizuku-relay 0.1.0\ndevice: {}\nmcp: POST /mcp (Bearer)\nrelay: GET /relay (Bearer)\n",
-        if online { "connected" } else { "offline" }
-    )
+async fn root() -> impl IntoResponse {
+    "shizuku-relay 0.1.0\nmcp: POST /mcp (Bearer)\nrelay: GET /relay (Bearer)\n"
 }
 
-async fn health(State(st): State<App>) -> Response {
-    let guard = st.link.lock().await;
-    let (online, info) = match &*guard {
-        Some(l) => (true, l.device.lock().await.clone()),
-        None => (false, String::new()),
-    };
-    drop(guard);
-    Json(json!({"ok": true, "device": if online { "connected" } else { "offline" }, "info": info}))
-        .into_response()
+async fn health() -> Response {
+    // No device data for anonymous callers.
+    Json(json!({"ok": true})).into_response()
 }
 
 async fn mcp_post(State(st): State<App>, headers: HeaderMap, body: String) -> Response {
@@ -183,13 +195,16 @@ async fn relay_ws(State(st): State<App>, ws: WebSocketUpgrade) -> Response {
 
 async fn relay_loop(st: App, mut socket: WebSocket) {
     let id = st.seq.fetch_add(1, Ordering::SeqCst);
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
     let device = Arc::new(Mutex::new(String::new()));
-    *st.link.lock().await = Some(Link {
+    let old = st.link.lock().await.replace(Link {
         id,
         tx,
         device: device.clone(),
     });
+    if let Some(old) = old {
+        let _ = old.tx.send(Out::Close);
+    }
 
     let mut last = Instant::now();
     loop {
@@ -233,7 +248,14 @@ async fn relay_loop(st: App, mut socket: WebSocket) {
                 }
             }
             Some(out) = rx.recv() => {
-                if socket.send(Message::Text(out.into())).await.is_err() { break; }
+                let sent = match out {
+                    Out::Text(text) => socket.send(Message::Text(text.into())).await.is_ok(),
+                    Out::Close => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        false
+                    }
+                };
+                if !sent { break; }
             }
         }
     }
@@ -268,7 +290,7 @@ async fn exec_capped(st: &App, cmd: &str, secs: u64, cap: usize) -> Result<Strin
     let id = st.seq.fetch_add(1, Ordering::SeqCst);
     let (otx, orx) = oneshot::channel();
     st.pending.lock().await.insert(id, otx);
-    if tx.send(json!({"id": id, "cmd": cmd}).to_string()).is_err() {
+    if tx.send(Out::Text(json!({"id": id, "cmd": cmd}).to_string())).is_err() {
         st.pending.lock().await.remove(&id);
         return Err("Device link closed.".into());
     }
@@ -602,8 +624,8 @@ fn parse_ui(xml: &str) -> String {
 async fn main() {
     let mcp = std::env::var("MCP_HTTP_TOKEN").unwrap_or_default();
     let relay = std::env::var("RELAY_TOKEN").unwrap_or_default();
-    if mcp.len() < 16 || relay.len() < 16 {
-        eprintln!("Set MCP_HTTP_TOKEN and RELAY_TOKEN (16+ chars each).");
+    if mcp.len() < 32 || relay.len() < 32 {
+        eprintln!("Set MCP_HTTP_TOKEN and RELAY_TOKEN (32+ chars each).");
         std::process::exit(1);
     }
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(10_000);

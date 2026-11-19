@@ -6,6 +6,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!-- Same-app only: blocks other apps from sending approve/deny on API 26-32. -->
+    <permission
+        android:name="dev.shizuku.relay.APPROVE"
+        android:protectionLevel="signature" />
+
     <application
         android:allowBackup="false"
         android:label="Shizuku Relay"

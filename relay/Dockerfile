@@ -9,6 +9,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/shizuku-relay /usr/local/bin/relay
+USER 10001:10001
 ENV PORT=10000
 EXPOSE 10000
 CMD ["relay"]
