@@ -26,6 +26,7 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class RelayService : Service() {
 
@@ -52,10 +53,17 @@ class RelayService : Service() {
     }
     private val work = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
+    @Volatile
     private var socket: WebSocket? = null
     private var retry = 0
+
+    @Volatile
     private var stopped = false
+
+    @Volatile
     private var lastCmdAt = SystemClock.elapsedRealtime()
+
+    private val busy = AtomicBoolean(false)
 
     private val approvalLock = java.lang.Object()
     private var approvalId = -1L
@@ -76,7 +84,7 @@ class RelayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        connect()
+        if (socket == null) connect()
         return START_STICKY
     }
 
@@ -85,6 +93,7 @@ class RelayService : Service() {
     override fun onDestroy() {
         stopped = true
         socket?.cancel()
+        socket = null
         main.removeCallbacksAndMessages(null)
         if (receiverOn) {
             runCatching { unregisterReceiver(approvals) }
@@ -97,7 +106,7 @@ class RelayService : Service() {
     // ---------- link ----------
 
     private fun connect() {
-        if (stopped) return
+        if (stopped || socket != null) return
         val url = Prefs.url(this)
         val token = Prefs.token(this)
         if (url.isEmpty() || token.isEmpty()) {
@@ -114,6 +123,10 @@ class RelayService : Service() {
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(ws: WebSocket, response: Response) {
+            if (ws !== socket) {
+                ws.close(1000, null)
+                return
+            }
             retry = 0
             ws.send(
                 JSONObject().put(
@@ -128,6 +141,7 @@ class RelayService : Service() {
         }
 
         override fun onMessage(ws: WebSocket, text: String) {
+            if (ws !== socket) return
             val o = runCatching { JSONObject(text) }.getOrNull() ?: return
             val id = o.optLong("id", -1)
             val cmd = o.optString("cmd")
@@ -137,13 +151,15 @@ class RelayService : Service() {
         }
 
         override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-            if (socket === ws) socket = null
+            if (ws !== socket) return
+            socket = null
             setStatus("Link lost: ${t.message ?: t.javaClass.simpleName}")
             reconnect()
         }
 
         override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-            if (socket === ws) socket = null
+            if (ws !== socket) return
+            socket = null
             setStatus("Link closed")
             reconnect()
         }
@@ -157,24 +173,37 @@ class RelayService : Service() {
         main.postDelayed(reconnectTask, delay)
     }
 
-    private val reconnectTask = Runnable {
-        socket?.cancel()
-        connect()
-    }
+    private val reconnectTask = Runnable { connect() }
 
     // ---------- command ----------
 
     private fun handle(ws: WebSocket, id: Long, cmd: String) {
-        if (cmd.length > 4096) {
-            reply(ws, id, false, "Command too long.", -1)
+        // One at a time. A late command would otherwise queue behind a run that
+        // the relay already timed out.
+        if (!busy.compareAndSet(false, true)) {
+            reply(ws, id, false, "Busy. Try again.", -1)
             return
         }
-        if (Prefs.ask(this) && !askUser(id, cmd)) {
-            reply(ws, id, false, "Denied by user.", -1)
-            return
+        try {
+            if (cmd.length > 4096) {
+                reply(ws, id, false, "Command too long.", -1)
+                return
+            }
+            if (Prefs.ask(this)) {
+                if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) {
+                    reply(ws, id, false, "Notifications are off. Allow them for this app.", -1)
+                    return
+                }
+                if (!askUser(id, cmd)) {
+                    reply(ws, id, false, "Denied.", -1)
+                    return
+                }
+            }
+            val r = Shell.run(cmd)
+            reply(ws, id, r.ok, r.out, r.code)
+        } finally {
+            busy.set(false)
         }
-        val r = Shell.run(cmd)
-        reply(ws, id, r.ok, r.out, r.code)
     }
 
     private fun reply(ws: WebSocket, id: Long, ok: Boolean, out: String, code: Int) {
@@ -200,13 +229,13 @@ class RelayService : Service() {
             .setStyle(NotificationCompat.BigTextStyle().bigText(cmd.take(800)))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
-            .setTimeoutAfter(60_000)
+            .setTimeoutAfter(30_000)
             .addAction(0, "Deny", approvalIntent(ACTION_DENY, id, 3))
             .addAction(0, "Approve", approvalIntent(ACTION_APPROVE, id, 4))
             .build()
         runCatching { NotificationManagerCompat.from(this).notify(ASK_ID, n) }
 
-        val deadline = System.currentTimeMillis() + 60_000
+        val deadline = System.currentTimeMillis() + 30_000
         synchronized(approvalLock) {
             while (approvalAnswer == null && !stopped) {
                 val left = deadline - System.currentTimeMillis()

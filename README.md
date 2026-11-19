@@ -56,7 +56,7 @@ In the app:
 1. URL: `wss://<your-service>.onrender.com/relay`
 2. Relay token: the `RELAY_TOKEN` value.
 3. Keep **Ask before each command** on. You get a notification with
-   Approve/Deny for each command. No answer in 60 s means deny.
+   Approve/Deny for each command. No answer in 30 s means deny.
 4. Press **Start** and grant Shizuku permission.
 
 Allow notifications for the app. Without it, approval prompts cannot show and
@@ -104,13 +104,14 @@ curl -s https://<service>.onrender.com/mcp \
 
 - MCP calls need `MCP_HTTP_TOKEN`. The device link needs `RELAY_TOKEN`. Token
   compare has no early exit.
-- One command runs at a time. The relay waits, then fails at 20-30 s.
+- One command runs at a time. The relay waits up to 75 s (30 s approval + 30 s shell), then fails.
 - Output cap: 256 KB. Screenshot cap: 8 MB. Command cap: 4096 bytes.
 - `input text` accepts ASCII letters, digits and `.,:/@_+-` only. Spaces become
   `%s`. Shell text is never passed through.
 - No logs of command output. The Rust server writes one start line only.
 - The phone link drops after 5 minutes of silence. The server sends a WebSocket
-  ping every 30 s to check the link.
+  ping every 30 s to check the link. The link accepts the token in the
+  `Authorization: Bearer` header only.
 
 ## Limits (known, not hidden)
 

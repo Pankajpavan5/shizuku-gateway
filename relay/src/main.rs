@@ -13,7 +13,7 @@ use std::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        State,
     },
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -29,6 +29,7 @@ use tokio::{
 const OUT_CAP: usize = 256 * 1024;
 const SHOT_CAP: usize = 8 * 1024 * 1024;
 const IDLE_SECS: u64 = 300;
+const EXEC_SECS: u64 = 75;
 
 #[derive(Clone)]
 struct App {
@@ -83,13 +84,8 @@ async fn relay_gate(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let from_query = req.uri().query().and_then(|q| {
-        q.split('&')
-            .find_map(|kv| kv.strip_prefix("token="))
-            .map(str::to_string)
-    });
-    let token = from_query.as_deref().or_else(|| bearer(&headers));
-    if token.is_some_and(|t| ct_eq(t, &st.relay_token)) {
+    // Bearer only: a token in the URL would land in proxy logs.
+    if bearer(&headers).is_some_and(|t| ct_eq(t, &st.relay_token)) {
         next.run(req).await
     } else {
         (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
@@ -181,19 +177,7 @@ async fn mcp_post(State(st): State<App>, headers: HeaderMap, body: String) -> Re
 
 // ---------- device link ----------
 
-async fn relay_ws(
-    State(st): State<App>,
-    Query(q): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let token = q
-        .get("token")
-        .map(String::as_str)
-        .or_else(|| bearer(&headers));
-    if !token.is_some_and(|t| ct_eq(t, &st.relay_token)) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
+async fn relay_ws(State(st): State<App>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| relay_loop(st, socket))
 }
 
@@ -254,9 +238,17 @@ async fn relay_loop(st: App, mut socket: WebSocket) {
         }
     }
 
-    let mut link = st.link.lock().await;
-    if link.as_ref().is_some_and(|l| l.id == id) {
-        *link = None;
+    let was_current = {
+        let mut link = st.link.lock().await;
+        let current = link.as_ref().is_some_and(|l| l.id == id);
+        if current {
+            *link = None;
+        }
+        current
+    };
+    // Wake in-flight calls at once; their senders drop with the map.
+    if was_current {
+        st.pending.lock().await.clear();
     }
 }
 
@@ -394,7 +386,7 @@ async fn run_tool(st: &App, name: &str, a: &Value) -> Result<Vec<Value>, String>
             let out = exec(
                 st,
                 "echo uid=$(id -u); echo sdk=$(getprop ro.build.version.sdk); echo sh=$(command -v sh)",
-                15,
+                EXEC_SECS,
             )
             .await?;
             Ok(text(out))
@@ -407,7 +399,7 @@ async fn run_tool(st: &App, name: &str, a: &Value) -> Result<Vec<Value>, String>
             if cmd.len() > 4096 {
                 return Err("command too long (max 4096 bytes)".into());
             }
-            Ok(text(exec(st, cmd, 20).await?))
+            Ok(text(exec(st, cmd, EXEC_SECS).await?))
         }
         "device_info" => {
             let cmd = "echo model=$(getprop ro.product.model); \
@@ -415,14 +407,14 @@ async fn run_tool(st: &App, name: &str, a: &Value) -> Result<Vec<Value>, String>
                        echo sdk=$(getprop ro.build.version.sdk); \
                        echo abi=$(getprop ro.product.cpu.abi); \
                        dumpsys battery | grep -E 'level|status|temperature'";
-            Ok(text(exec(st, cmd, 20).await?))
+            Ok(text(exec(st, cmd, EXEC_SECS).await?))
         }
         "ui_dump" => {
             let out = exec(
                 st,
                 "uiautomator dump /data/local/tmp/.relay_ui.xml >/dev/null 2>&1; \
                  cat /data/local/tmp/.relay_ui.xml; rm -f /data/local/tmp/.relay_ui.xml",
-                25,
+                EXEC_SECS,
             )
             .await?;
             let rows = parse_ui(&out);
@@ -437,7 +429,7 @@ async fn run_tool(st: &App, name: &str, a: &Value) -> Result<Vec<Value>, String>
                 "screencap -p /data/local/tmp/.relay_shot.png && \
                  base64 /data/local/tmp/.relay_shot.png | tr -d '\\n'; \
                  rm -f /data/local/tmp/.relay_shot.png",
-                30,
+                EXEC_SECS,
                 SHOT_CAP,
             )
             .await?;
@@ -447,13 +439,13 @@ async fn run_tool(st: &App, name: &str, a: &Value) -> Result<Vec<Value>, String>
             }
             Ok(vec![json!({"type": "image", "data": data, "mimeType": "image/png"})])
         }
-        "input" => Ok(text(exec(st, &build_input(a)?, 20).await?)),
+        "input" => Ok(text(exec(st, &build_input(a)?, EXEC_SECS).await?)),
         "current_app" => Ok(text(
             exec(
                 st,
                 "dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -3; \
                  dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' | head -3",
-                20,
+                EXEC_SECS,
             )
             .await?,
         )),
@@ -462,61 +454,31 @@ async fn run_tool(st: &App, name: &str, a: &Value) -> Result<Vec<Value>, String>
                 st,
                 "dumpsys power | grep -E 'mWakefulness=|Display Power' | head -4; \
                  dumpsys window | grep -E 'mShowingLockscreen|isKeyguardShowing|mDreamingLockscreen' | head -4",
-                20,
+                EXEC_SECS,
             )
             .await?,
         )),
         "observe" => {
-            let screen = exec(
+            // One command, so the phone asks for approval once.
+            let out = exec(
                 st,
-                "dumpsys power | grep -E 'mWakefulness=|Display Power' | head -4",
-                15,
+                "echo '== screen'; (dumpsys power | grep -E 'mWakefulness=|Display Power' | head -4) 2>&1; \
+                 echo '== app'; (dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -2) 2>&1; \
+                 echo '== ui'; uiautomator dump /data/local/tmp/.relay_ui.xml >/dev/null 2>&1; \
+                 cat /data/local/tmp/.relay_ui.xml 2>/dev/null; rm -f /data/local/tmp/.relay_ui.xml",
+                EXEC_SECS,
             )
-            .await;
-            let app = exec(
-                st,
-                "dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity' | head -2",
-                15,
-            )
-            .await;
-            let ui = exec(
-                st,
-                "uiautomator dump /data/local/tmp/.relay_ui.xml >/dev/null 2>&1; \
-                 cat /data/local/tmp/.relay_ui.xml; rm -f /data/local/tmp/.relay_ui.xml",
-                25,
-            )
-            .await;
-            if screen.is_err() && app.is_err() && ui.is_err() {
-                return Err("All three reads failed. Is the device online?".into());
-            }
-            let part = |title: &str, r: Result<String, String>| match r {
-                Ok(s) if !s.trim().is_empty() => format!("== {title}\n{s}"),
-                Ok(_) => format!("== {title}\n(empty)"),
-                Err(e) => format!("== {title}\n(error) {e}"),
-            };
-            let ui_text = match ui {
-                Ok(xml) => {
-                    let rows = parse_ui(&xml);
-                    if rows.is_empty() {
-                        "(no elements)".to_string()
-                    } else {
-                        rows
-                    }
-                }
-                Err(e) => format!("(error) {e}"),
-            };
-            Ok(text(format!(
-                "{}\n{}\n== ui\n{}",
-                part("screen", screen),
-                part("app", app),
-                ui_text
-            )))
+            .await?;
+            let (head, xml) = out.split_once("== ui\n").unwrap_or((out.as_str(), ""));
+            let rows = parse_ui(xml);
+            let ui = if rows.is_empty() { "(no elements)".to_string() } else { rows };
+            Ok(text(format!("{}\n== ui\n{}", head.trim_end(), ui.trim_end())))
         }
         "notifications" => {
             let out = exec_capped(
                 st,
                 "dumpsys notification --noredact 2>/dev/null | grep -E 'android.title=|android.text=' | tail -60",
-                20,
+                EXEC_SECS,
                 4096,
             )
             .await?;
@@ -777,8 +739,11 @@ mod tests {
             let _ = axum::serve(listener, router(served)).await;
         });
 
-        let url = format!("ws://{addr}/relay?token=relay-token-0123456789");
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/relay").into_client_request().unwrap();
+        req.headers_mut()
+            .insert("authorization", "Bearer relay-token-0123456789".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
         ws.send(WsMsg::text(r#"{"hello":{"model":"SM-A346E"}}"#))
             .await
             .unwrap();
